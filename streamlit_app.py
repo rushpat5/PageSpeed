@@ -1,38 +1,3 @@
-Here is a complete, step-by-step guide to building and deploying your free PageSpeed Insights app using Python and Streamlit.
-
-The Plan
-
-The Logic: We will use Google's free PageSpeed Insights API to analyze the URL.[1][2]
-
-The Code: We will write a Python script that fetches this data and formats it into a professional Excel file.
-
-The App: We will wrap this code in a Streamlit web interface.
-
-Deployment: We will upload it to GitHub and connect it to Streamlit Cloud (free hosting).[3]
-
-Step 1: Get Your Free Google API Key
-
-While the API works without a key for a few requests, it’s safer and more reliable to have one.
-
-Go to the Google Cloud Console Credentials page.
-
-Click Create Credentials > API Key.
-
-Copy the key generated (it looks like AIzaSy...).
-
-Important: Enable the "PageSpeed Insights API" in the library for your project if it's not already enabled.
-
-Step 2: The Full Python Code
-
-You don't need to write this. I have written the complete, ready-to-use code for you.
-
-Create a file on your computer named streamlit_app.py and paste this code inside:
-
-code
-Python
-download
-content_copy
-expand_less
 import streamlit as st
 import requests
 import pandas as pd
@@ -61,7 +26,7 @@ def process_lighthouse_data(json_data):
     issues = []
 
     for audit_id, audit in audits.items():
-        # We only want audits that are "opportunities" or "diagnostics" (usually score < 0.9 or null score but with details)
+        # We only want audits that are "opportunities" or "diagnostics" 
         score = audit.get("score")
         score_display_mode = audit.get("scoreDisplayMode")
         
@@ -69,9 +34,9 @@ def process_lighthouse_data(json_data):
         if (score is not None and score < 0.9) or (score_display_mode == "informative" and "displayValue" in audit):
             
             issues.append({
-                "Category": "Performance", # Simplified for this specific API endpoint
+                "Category": "Performance", 
                 "Issue Title": audit.get("title"),
-                "Description": audit.get("description", "").split("[")[0], # Remove "Learn more" links for clean text
+                "Description": audit.get("description", "").split("[")[0], # Remove links for clean text
                 "Score (0-1)": score if score is not None else "N/A",
                 "Display Value": audit.get("displayValue", ""),
             })
@@ -87,7 +52,7 @@ def to_excel(df):
     # Formats
     header_fmt = workbook.add_format({'bold': True, 'font_color': 'white', 'bg_color': '#4F81BD', 'border': 1})
     text_wrap_fmt = workbook.add_format({'text_wrap': True, 'valign': 'top', 'border': 1})
-    score_bad_fmt = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006', 'border': 1}) # Red text
+    score_bad_fmt = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006', 'border': 1}) 
     
     # Write Headers
     headers = list(df.columns)
@@ -162,91 +127,3 @@ if submitted and url_input:
             else:
                 st.balloons()
                 st.success("No significant issues found! Great job.")
-Step 3: The requirements.txt File
-
-You need one more file to tell the server which libraries to install.
-Create a file named requirements.txt in the same folder and add these lines:
-
-code
-Text
-download
-content_copy
-expand_less
-streamlit
-requests
-pandas
-xlsxwriter
-openpyxl
-Step 4: Upload to GitHub
-
-Create a GitHub Account if you don’t have one (it's free).[3]
-
-Create a New Repository:
-
-Click the + icon in the top right > New repository.
-
-Name it something like pagespeed-auditor.[4]
-
-Check "Public".
-
-Click Create repository.
-
-Upload Files:
-
-Click uploading an existing file (link usually shown on the new repo screen).
-
-Drag and drop your streamlit_app.py and requirements.txt files there.
-
-Click Commit changes.
-
-Step 5: Deploy on Streamlit Cloud
-
-Go to share.streamlit.io and sign in with your GitHub account.
-
-Click New app.
-
-Repository: Select the pagespeed-auditor repo you just created.
-
-Branch: usually main or master.
-
-Main file path: streamlit_app.py.
-
-Click Deploy!
-
-How to Use It
-
-Once deployed (it takes about 1-2 minutes to "bake"), you will get a public URL.
-
-Paste the website link you want to check.
-
-(Optional) Paste your Google API Key.
-
-Click Run Audit.
-
-Wait ~15 seconds.
-
-Click the Download Client-Ready Excel Report button.
-
-The Excel file will have bold headers, text wrapping, and red highlighting for bad scores—ready to email directly to your client or tech team.
-
-Sources
-help
-kinsta.com
-dev.to
-youtube.com
-ojdo.de
-medium.com
-addyosmani.com
-github.com
-apify.com
-streamlit.io
-ploomber.io
-medium.com
-medium.com
-Google Search Suggestions
-Display of Search Suggestions is required when using Grounding with Google Search. Learn more
-streamlit community cloud github deployment tutorial
-python pandas write excel with formatting openpyxl
-google pagespeed insights api python free
-google pagespeed insights api extract audit details python
-google pagespeed insights api json response structure lighthouse issues
