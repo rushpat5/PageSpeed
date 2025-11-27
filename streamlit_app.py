@@ -6,13 +6,12 @@ import plotly.graph_objects as go
 import re
 
 # -----------------------------------------------------------------------------
-# 1. VISUAL CONFIGURATION (Dejan Style - Light Mode Forced)
+# 1. VISUAL CONFIGURATION
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="PageSpeed Forensics", layout="wide", page_icon="⚡")
 
 st.markdown("""
 <style>
-    /* --- FORCE LIGHT MODE --- */
     :root { --primary-color: #1a7f37; --background-color: #ffffff; --secondary-background-color: #f6f8fa; --text-color: #24292e; --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
     .stApp { background-color: #ffffff; color: #24292e; }
     h1, h2, h3, h4, .markdown-text-container { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #000000 !important; letter-spacing: -0.3px; }
@@ -49,7 +48,6 @@ def run_pagespeed(url, strategy, api_key=None):
         return None, str(e)
 
 def parse_crux(data):
-    """Extracts Real User Experience (Field Data)"""
     loading = data.get("loadingExperience", {})
     metrics = loading.get("metrics", {})
     if not metrics: return None
@@ -60,33 +58,26 @@ def parse_crux(data):
         "FCP": metrics.get("FIRST_CONTENTFUL_PAINT_MS", {}).get("percentile", 0) / 1000,
     }
 
-def recursive_chain_extract(node, items_list):
-    """Recursively extracts URLs from Critical Request Chains"""
-    if not node: return
-    # Extract current node if it has a request
-    if 'request' in node:
-        items_list.append({
-            "Resource": node['request'].get('url', 'Unknown'),
-            "Size": f"{node['request'].get('transferSize', 0)/1024:.1f} KB",
-            "Time": f"{node['request'].get('startTime', 0):.2f}s"
-        })
-    # Recurse into children
-    children = node.get('children', {})
-    for child_id, child_node in children.items():
-        recursive_chain_extract(child_node, items_list)
-
 def process_audit_details(audit):
-    """Universal extractor for Tables AND Critical Chains."""
+    """
+    Robust extractor that handles multiple Lighthouse data formats.
+    1. Table Mode (Standard)
+    2. Opportunity Mode (Savings)
+    3. Critical Request Chains (Tree - flattened)
+    """
     details = audit.get("details", {})
-    if not details: return None
-
-    processed_rows = []
-
-    # CASE A: Standard Tables (Render Blocking, Unused JS, etc)
-    if details.get("type") == "table" and "items" in details:
+    items = details.get("items", [])
+    
+    # CASE 1: Standard Table / Opportunity
+    if items:
+        # Try to find headers
         headings = details.get("headings", [])
-        items = details.get("items", [])
+        if not headings:
+            # Auto-generate headers from the first item keys if missing
+            if len(items) > 0:
+                headings = [{"key": k, "text": k} for k in items[0].keys()]
         
+        processed_rows = []
         for item in items:
             row = {}
             for heading in headings:
@@ -94,58 +85,75 @@ def process_audit_details(audit):
                 label = heading.get("text")
                 val = item.get(key)
                 
+                # Check nested values (e.g. source location)
+                if isinstance(val, dict):
+                    val = val.get("url", val.get("value", str(val)))
+
+                # Formatter
                 if val is not None:
-                    if isinstance(val, str) and (val.startswith("http") or val.startswith("//")):
-                        row["Resource"] = val
-                    elif "Bytes" in key or "Size" in key:
-                        if isinstance(val, (int, float)):
-                            row[label] = f"{val / 1024:.1f} KB"
-                        else:
-                            row[label] = str(val)
-                    elif "Ms" in key or "Time" in key:
-                        row[label] = f"{val} ms"
+                    # Time
+                    if "time" in str(key).lower() or "ms" in str(key).lower():
+                        try: row[label] = f"{float(val):.0f} ms"
+                        except: row[label] = val
+                    # Bytes
+                    elif "bytes" in str(key).lower() or "size" in str(key).lower():
+                        try: row[label] = f"{float(val)/1024:.1f} KB"
+                        except: row[label] = val
                     else:
-                        if isinstance(val, dict): 
-                            row[label] = val.get("value", str(val))
-                        else:
-                            row[label] = val
-            if row:
-                processed_rows.append(row)
+                        row[label] = val
+            
+            if row: processed_rows.append(row)
+            
+        if processed_rows:
+            return pd.DataFrame(processed_rows)
 
-    # CASE B: Critical Request Chains (The "Network Dependency Tree")
-    elif details.get("type") == "criticalrequestchain":
+    # CASE 2: Critical Request Chains (Dependency Tree)
+    if details.get("type") == "criticalrequestchain":
         chains = details.get("chains", {})
-        # Chains are nested objects. We need to flatten them.
-        for root_id, root_node in chains.items():
-            recursive_chain_extract(root_node, processed_rows)
+        
+        flat_chain = []
+        def traverse(chain, depth=0):
+            for key, node in chain.items():
+                req = node.get("request", {})
+                flat_chain.append({
+                    "Depth": depth,
+                    "URL": req.get("url"),
+                    "Transfer Size": f"{req.get('transferSize', 0)/1024:.1f} KB",
+                    "Time Spent": f"{req.get('startTime', 0):.0f} ms"
+                })
+                if "children" in node:
+                    traverse(node["children"], depth+1)
+        
+        traverse(chains)
+        if flat_chain:
+            return pd.DataFrame(flat_chain)
 
-    if not processed_rows: return None
-    return pd.DataFrame(processed_rows)
+    return None
 
 def get_failed_audits(lighthouse):
-    """Filters all audits to find the ones that actually failed."""
     audits = lighthouse.get("audits", {})
     failed = []
     
     for key, audit in audits.items():
         score = audit.get("score")
         
-        # Capture Fails (Score < 0.9) OR Diagnostic Infos (Manual checks)
-        if (score is not None and score < 0.9) or (audit.get("scoreDisplayMode") == "informative" and "diagnostic" in audit.get("group", "")):
-            
-            # Clean description
+        # Criteria for "Actionable Issue"
+        is_fail = (score is not None and score < 0.9)
+        is_informative = (audit.get("scoreDisplayMode") in ["informative", "manual"])
+        
+        # We allow informative if it contains data items (like Diagnostics)
+        has_items = bool(audit.get("details", {}).get("items"))
+        
+        if is_fail or (is_informative and has_items):
             desc = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', audit.get("description", ""))
             
-            # Extract details using the Robust Processor
-            details_df = process_audit_details(audit)
-
             failed.append({
                 "id": key,
                 "title": audit.get("title"),
                 "score": score,
                 "displayValue": audit.get("displayValue"),
                 "description": desc,
-                "details_df": details_df
+                "details_df": process_audit_details(audit)
             })
             
     return sorted(failed, key=lambda x: (x['score'] if x['score'] is not None else 1.0))
@@ -156,14 +164,13 @@ def get_failed_audits(lighthouse):
 with st.sidebar:
     st.markdown("### ⚙️ Audit Config")
     strategy = st.selectbox("Device Emulation", ["mobile", "desktop"], index=0)
-    api_key = st.text_input("Google API Key (Optional)", type="password", help="Recommended for stability.")
+    api_key = st.text_input("Google API Key (Optional)", type="password")
     
     st.markdown("---")
     st.markdown("""
     **Methodology:**
     <div class="tech-note">
-    <b>Forensic Deep Dive:</b> Unlike the basic web view, this tool extracts the <b>Hidden Detail Tables</b> from the API.
-    <br>It identifies the specific <code>.js</code>, <code>.css</code>, or image files causing bottlenecks.
+    <b>Forensic Deep Dive:</b> Unlike standard tools, we parse the <b>Critical Request Chains</b> and <b>Diagnostic Tables</b> to find the root cause filename.
     </div>
     """, unsafe_allow_html=True)
 
@@ -177,8 +184,8 @@ st.markdown("### Core Web Vitals & Critical Path Analysis")
 with st.expander("How this tool differs from Google PSI", expanded=False):
     st.markdown("""
     **1. Separation of Concerns:** We strictly separate **User Data (CrUX)** from **Lab Simulation**.
-    **2. Culprit Extraction:** We recursively parse nested dependency trees to find hidden render-blocking chains.
-    **3. 3rd Party Focus:** We aggregate external scripts to show you exactly how much your Chatbot or Analytics is costing you in load time.
+    **2. Deep Extraction:** We unpack nested JSON trees (like Dependency Chains) into readable tables.
+    **3. 3rd Party Attribution:** We highlight external scripts blocking the CPU.
     """)
 
 st.write("")
@@ -196,13 +203,13 @@ if run_btn and url_input:
             lh = data.get("lighthouseResult", {})
             crux = parse_crux(data)
             
-            # --- HEADER METRICS ---
+            # --- SECTION 1: FIELD DATA ---
             st.markdown("### 1. Real User Experience (CrUX)")
             if crux:
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("LCP (Loading)", f"{crux['LCP']}s", delta_color="off" if crux['LCP']>2.5 else "normal", delta="Needs < 2.5s" if crux['LCP']>2.5 else "Good")
-                c2.metric("INP (Responsiveness)", f"{crux['INP']}ms", delta_color="off" if crux['INP']>200 else "normal", delta="Needs < 200ms" if crux['INP']>200 else "Good")
-                c3.metric("CLS (Visual Stability)", f"{crux['CLS']}", delta_color="off" if crux['CLS']>0.1 else "normal", delta="Needs < 0.1" if crux['CLS']>0.1 else "Good")
+                c1.metric("LCP (Loading)", f"{crux['LCP']}s", delta_color="off" if crux['LCP']>2.5 else "normal", delta="Target < 2.5s" if crux['LCP']>2.5 else "Good")
+                c2.metric("INP (Responsiveness)", f"{crux['INP']}ms", delta_color="off" if crux['INP']>200 else "normal", delta="Target < 200ms" if crux['INP']>200 else "Good")
+                c3.metric("CLS (Visual Stability)", f"{crux['CLS']}", delta_color="off" if crux['CLS']>0.1 else "normal", delta="Target < 0.1" if crux['CLS']>0.1 else "Good")
                 c4.metric("FCP (First Paint)", f"{crux['FCP']}s")
             else:
                 st.info("No Field Data available. The report will rely on Lab Simulation below.")
@@ -217,32 +224,31 @@ if run_btn and url_input:
             with col_gauge:
                 fig = go.Figure(go.Indicator(
                     mode = "gauge+number", value = perf_score, title = {'text': "Performance"},
-                    gauge = { 'axis': {'range': [None, 100]}, 'bar': {'color': "#1a7f37" if perf_score >= 90 else "#d93025"}, 'steps': [{'range': [0, 90], 'color': "#f6f8fa"}]}
+                    gauge = {'axis': {'range': [None, 100]}, 'bar': {'color': "#1a7f37" if perf_score >= 90 else "#d93025"}, 'steps': [{'range': [0, 90], 'color': "#f6f8fa"}]}
                 ))
                 fig.update_layout(height=200, margin=dict(l=20,r=20,t=30,b=20))
                 st.plotly_chart(fig, use_container_width=True)
             
             with col_main_metrics:
-                st.markdown("#### The 'Why': Resource Weight")
-                res_audit = lh.get("audits", {}).get("resource-summary", {}).get("details", {}).get("items", [])
-                if res_audit:
-                    res_df = pd.DataFrame(res_audit)
+                st.markdown("#### Resource Weight")
+                items = lh.get("audits", {}).get("resource-summary", {}).get("details", {}).get("items", [])
+                if items:
+                    res_df = pd.DataFrame(items)
                     if 'label' in res_df.columns:
                         res_df = res_df[res_df['resourceType'] != 'total']
                         res_df['Size (KB)'] = (res_df['transferSize'] / 1024).round(1)
-                        fig_bar = px.bar(res_df, x='Size (KB)', y='label', orientation='h', text='Size (KB)', title="Page Weight by Content Type", color_discrete_sequence=['#24292e'])
+                        fig_bar = px.bar(res_df, x='Size (KB)', y='label', orientation='h', text='Size (KB)', color_discrete_sequence=['#24292e'])
                         fig_bar.update_layout(yaxis={'title': None}, plot_bgcolor='white')
                         st.plotly_chart(fig_bar, use_container_width=True)
 
-            # --- DEEP DIVE FINDINGS ---
+            # --- SECTION 3: FORENSICS ---
             st.markdown("### 3. Forensic Findings (Actionable)")
-            st.markdown("""<div class="tech-note">Below are the specific technical failures. 
-            Expand each row to see the exact <b>URLs</b> and <b>File Sizes</b> causing the issue.</div>""", unsafe_allow_html=True)
+            st.markdown("""<div class="tech-note">Specific technical failures. Expand rows to see filenames.</div>""", unsafe_allow_html=True)
             
             failures = get_failed_audits(lh)
             
             if not failures:
-                st.success("✅ Incredible! No major issues found in the Lab Audit.")
+                st.success("✅ No major issues found.")
             
             for fail in failures:
                 icon = "🔴" if (fail['score'] is not None and fail['score'] < 0.5) else "🟡"
@@ -253,17 +259,17 @@ if run_btn and url_input:
                 
                 with st.expander(label):
                     st.markdown(f"**Impact:** {fail['description']}")
+                    
                     if fail['details_df'] is not None:
+                        # Make links clickable if possible or just show them
                         st.dataframe(fail['details_df'], use_container_width=True, hide_index=True)
                     else:
-                        st.caption("No specific file breakdown available via API.")
+                        st.caption("No granular file data returned by API for this audit.")
 
-            # --- THIRD PARTY SUMMARY ---
             st.markdown("### 4. Third-Party Code Impact")
             tp_audit = lh.get("audits", {}).get("third-party-summary", {})
-            if tp_audit.get("details", {}).get("items"):
-                tp_df = process_audit_details(tp_audit)
-                if tp_df is not None:
-                    st.dataframe(tp_df, use_container_width=True, hide_index=True)
+            tp_df = process_audit_details(tp_audit)
+            if tp_df is not None:
+                st.dataframe(tp_df, use_container_width=True, hide_index=True)
             else:
                 st.info("No significant third-party code detected.")
