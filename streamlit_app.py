@@ -6,25 +6,38 @@ import plotly.graph_objects as go
 import re
 
 # -----------------------------------------------------------------------------
-# 1. VISUAL CONFIGURATION
+# 1. VISUAL CONFIGURATION (Dejan Style - Light Mode Forced)
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="PageSpeed Forensics", layout="wide", page_icon="⚡")
 
 st.markdown("""
 <style>
+    /* --- FORCE LIGHT MODE --- */
     :root { --primary-color: #1a7f37; --background-color: #ffffff; --secondary-background-color: #f6f8fa; --text-color: #24292e; --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
     .stApp { background-color: #ffffff; color: #24292e; }
+    
+    /* Typography */
     h1, h2, h3, h4, .markdown-text-container { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #000000 !important; letter-spacing: -0.3px; }
     p, li, span, div { color: #24292e; }
     a { color: #0969da; text-decoration: none; }
+    
+    /* Sidebar */
     section[data-testid="stSidebar"] { background-color: #f6f8fa; border-right: 1px solid #d0d7de; }
     section[data-testid="stSidebar"] * { color: #24292e !important; }
+    
+    /* Inputs */
     .stTextInput input { background-color: #f6f8fa !important; border: 1px solid #d0d7de !important; color: #24292e !important; }
     .stTextInput input:focus { border-color: #1a7f37 !important; box-shadow: 0 0 0 1px #1a7f37 !important; }
+    
+    /* Metrics & Tables */
     div[data-testid="stMetricValue"] { font-size: 1.8rem !important; color: #1a7f37 !important; font-weight: 700; }
     div[data-testid="stMetricLabel"] { font-size: 0.9rem !important; color: #586069 !important; }
     [data-testid="stDataFrame"] { border: 1px solid #e1e4e8; }
+    
+    /* Tech Note */
     .tech-note { font-size: 0.85rem; color: #57606a; background-color: #f3f4f6; border-left: 3px solid #0969da; padding: 12px; margin-top: 8px; margin-bottom: 15px; border-radius: 0 4px 4px 0; line-height: 1.5; }
+
+    /* Clean UI */
     #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
@@ -43,7 +56,8 @@ def run_pagespeed(url, strategy, api_key=None):
         if response.status_code == 200:
             return response.json(), None
         else:
-            return None, f"API Error {response.status_code}: {response.json().get('error', {}).get('message', 'Unknown error')}"
+            err_msg = response.json().get('error', {}).get('message', 'Unknown error')
+            return None, f"API Error {response.status_code}: {err_msg}"
     except Exception as e:
         return None, str(e)
 
@@ -164,7 +178,17 @@ def get_failed_audits(lighthouse):
 with st.sidebar:
     st.markdown("### ⚙️ Audit Config")
     strategy = st.selectbox("Device Emulation", ["mobile", "desktop"], index=0)
-    api_key = st.text_input("Google API Key (Optional)", type="password")
+    
+    # NEW: Direct link to get the key
+    st.markdown("""
+    <div style="margin-bottom: 5px;">
+        <a href="https://developers.google.com/speed/docs/insights/v5/get-started" target="_blank" style="font-size: 0.85rem; color: #0969da; text-decoration: none;">
+            🔑 Get a Free Google API Key
+        </a>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    api_key = st.text_input("Google API Key", type="password", help="Required to bypass Google's 429 Quota limits.")
     
     st.markdown("---")
     st.markdown("""
@@ -203,10 +227,12 @@ if run_btn and url_input:
             lh = data.get("lighthouseResult", {})
             crux = parse_crux(data)
             
-            # --- SECTION 1: FIELD DATA ---
+            # --- HEADER METRICS ---
             st.markdown("### 1. Real User Experience (CrUX)")
             if crux:
                 c1, c2, c3, c4 = st.columns(4)
+                
+                # Logic: Green/Red coloring based on Google Core Vitals thresholds
                 c1.metric("LCP (Loading)", f"{crux['LCP']}s", delta_color="off" if crux['LCP']>2.5 else "normal", delta="Target < 2.5s" if crux['LCP']>2.5 else "Good")
                 c2.metric("INP (Responsiveness)", f"{crux['INP']}ms", delta_color="off" if crux['INP']>200 else "normal", delta="Target < 200ms" if crux['INP']>200 else "Good")
                 c3.metric("CLS (Visual Stability)", f"{crux['CLS']}", delta_color="off" if crux['CLS']>0.1 else "normal", delta="Target < 0.1" if crux['CLS']>0.1 else "Good")
@@ -217,6 +243,7 @@ if run_btn and url_input:
             st.markdown("---")
             st.markdown("### 2. Lab Simulation Diagnostics")
             
+            # Overall Score Gauge
             perf_score = lh.get("categories", {}).get("performance", {}).get("score", 0) * 100
             
             col_gauge, col_main_metrics = st.columns([1, 3])
@@ -241,35 +268,45 @@ if run_btn and url_input:
                         fig_bar.update_layout(yaxis={'title': None}, plot_bgcolor='white')
                         st.plotly_chart(fig_bar, use_container_width=True)
 
-            # --- SECTION 3: FORENSICS ---
+            # --- DEEP DIVE FINDINGS ---
             st.markdown("### 3. Forensic Findings (Actionable)")
-            st.markdown("""<div class="tech-note">Specific technical failures. Expand rows to see filenames.</div>""", unsafe_allow_html=True)
+            st.markdown("""<div class="tech-note">Below are the specific technical failures. 
+            Expand each row to see the exact <b>URLs</b> and <b>File Sizes</b> causing the issue.</div>""", unsafe_allow_html=True)
             
             failures = get_failed_audits(lh)
             
             if not failures:
-                st.success("✅ No major issues found.")
+                st.success("✅ Incredible! No major issues found in the Lab Audit.")
             
             for fail in failures:
+                # Icon based on score
                 icon = "🔴" if (fail['score'] is not None and fail['score'] < 0.5) else "🟡"
                 if fail['score'] is None: icon = "ℹ️"
                 
+                # Create readable title
                 label = f"{icon} {fail['title']}"
-                if fail.get('displayValue'): label += f" — {fail['displayValue']}"
+                if fail.get('displayValue'):
+                    label += f" — {fail['displayValue']}"
                 
                 with st.expander(label):
                     st.markdown(f"**Impact:** {fail['description']}")
                     
+                    # RENDER THE SPECIFIC LINKS / FILES
                     if fail['details_df'] is not None:
-                        # Make links clickable if possible or just show them
-                        st.dataframe(fail['details_df'], use_container_width=True, hide_index=True)
+                        st.dataframe(
+                            fail['details_df'], 
+                            use_container_width=True,
+                            hide_index=True
+                        )
                     else:
-                        st.caption("No granular file data returned by API for this audit.")
+                        st.caption("No specific file breakdown available via API.")
 
+            # --- THIRD PARTY SUMMARY ---
             st.markdown("### 4. Third-Party Code Impact")
             tp_audit = lh.get("audits", {}).get("third-party-summary", {})
-            tp_df = process_audit_details(tp_audit)
-            if tp_df is not None:
-                st.dataframe(tp_df, use_container_width=True, hide_index=True)
+            if tp_audit.get("details", {}).get("items"):
+                tp_df = process_audit_details(tp_audit)
+                if tp_df is not None:
+                    st.dataframe(tp_df, use_container_width=True, hide_index=True)
             else:
                 st.info("No significant third-party code detected.")
