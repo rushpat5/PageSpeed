@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import re
 
 # -----------------------------------------------------------------------------
-# 1. VISUAL CONFIGURATION (Dejan Style - Light Mode Forced)
+# 1. VISUAL CONFIGURATION
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="PageSpeed Forensics", 
@@ -20,35 +20,23 @@ st.markdown("""
     /* --- FORCE LIGHT MODE --- */
     :root { --primary-color: #1a7f37; --background-color: #ffffff; --secondary-background-color: #f6f8fa; --text-color: #24292e; --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
     .stApp { background-color: #ffffff; color: #24292e; }
-    
-    /* Typography */
     h1, h2, h3, h4, .markdown-text-container { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #000000 !important; letter-spacing: -0.3px; }
     p, li, span, div { color: #24292e; }
     a { color: #0969da; text-decoration: none; }
-    
-    /* Sidebar */
     section[data-testid="stSidebar"] { background-color: #f6f8fa; border-right: 1px solid #d0d7de; }
     section[data-testid="stSidebar"] * { color: #24292e !important; }
-    
-    /* Inputs */
     .stTextInput input { background-color: #f6f8fa !important; border: 1px solid #d0d7de !important; color: #24292e !important; }
     .stTextInput input:focus { border-color: #1a7f37 !important; box-shadow: 0 0 0 1px #1a7f37 !important; }
-    
-    /* Metrics & Tables */
     div[data-testid="stMetricValue"] { font-size: 1.8rem !important; color: #1a7f37 !important; font-weight: 700; }
     div[data-testid="stMetricLabel"] { font-size: 0.9rem !important; color: #586069 !important; }
     [data-testid="stDataFrame"] { border: 1px solid #e1e4e8; }
-    
-    /* Tech Note */
     .tech-note { font-size: 0.85rem; color: #57606a; background-color: #f3f4f6; border-left: 3px solid #0969da; padding: 12px; margin-top: 8px; margin-bottom: 15px; border-radius: 0 4px 4px 0; line-height: 1.5; }
-
-    /* Clean UI */
     #MainMenu {visibility: hidden;} footer {visibility: hidden;} 
 </style>
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. LOGIC ENGINE
+# 2. DATA EXTRACTION ENGINE (REHAULED)
 # -----------------------------------------------------------------------------
 
 def run_pagespeed(url, strategy, api_key=None):
@@ -62,10 +50,10 @@ def run_pagespeed(url, strategy, api_key=None):
             return response.json(), None
         else:
             try:
-                err_msg = response.json().get('error', {}).get('message', 'Unknown error')
+                err = response.json().get('error', {}).get('message', 'Unknown error')
             except:
-                err_msg = str(response.status_code)
-            return None, f"API Error {response.status_code}: {err_msg}"
+                err = f"Status {response.status_code}"
+            return None, f"API Error: {err}"
     except Exception as e:
         return None, str(e)
 
@@ -80,52 +68,64 @@ def parse_crux(data):
         "FCP": metrics.get("FIRST_CONTENTFUL_PAINT_MS", {}).get("percentile", 0) / 1000,
     }
 
-def clean_lighthouse_value(val):
+def safe_extract_value(cell):
     """
-    Recursively extracts readable text from Lighthouse's complex object structures.
-    Handles: nodes, source-locations, urls, and numerical values.
+    Smart extraction that handles Lighthouse's nested object types.
     """
-    if val is None:
+    if cell is None:
         return ""
     
-    # 1. If it's a Dictionary, assume it's a Lighthouse Object (Node, URL, Source)
-    if isinstance(val, dict):
-        # Type: URL or Link
-        if 'url' in val: 
-            return val['url']
-        # Type: Node (HTML Element) -> Get snippet or selector
-        if 'snippet' in val:
-            return val['snippet']
-        if 'selector' in val:
-            return val['selector']
-        # Type: Source Location (File + Line)
-        if 'source' in val: # sometimes nested
-            return clean_lighthouse_value(val['source'])
-        if 'file' in val:
-            return f"{val['file']} (L{val.get('line',0)})"
-        # Generic Value wrapper
-        if 'value' in val:
-            return str(val['value'])
+    # Primitive types
+    if isinstance(cell, (str, int, float, bool)):
+        return cell
         
-        # If unknown dict, try to convert to string representation
-        return str(val)
+    # Dictionary types (The cause of [object Object])
+    if isinstance(cell, dict):
+        # 1. URL Type
+        if 'url' in cell:
+            return cell['url']
+        
+        # 2. Source Location (File:Line)
+        if 'source' in cell:
+            # Recursive check if source is also a dict
+            src = cell['source']
+            if isinstance(src, dict):
+                return f"{src.get('url', 'Unknown')}:{src.get('line', 0)}"
+            return src
+            
+        # 3. Node/Element (Snippet)
+        if 'snippet' in cell:
+            return cell['snippet']
+        if 'selector' in cell:
+            return cell['selector']
+            
+        # 4. Numeric Value wrapper
+        if 'value' in cell:
+            return cell['value']
+            
+        # 5. Thumbnail
+        if 'type' in cell and cell['type'] == 'thumbnail':
+            return "(Image)"
 
-    # 2. If it's a List, join them
-    if isinstance(val, list):
-        return ", ".join([clean_lighthouse_value(v) for v in val])
+    # Fallback
+    return str(cell)
 
-    return val
-
-def format_metric_value(key, val):
-    """Formats numbers into KB/ms based on column name."""
+def format_column(header_key, val):
+    """Formats numbers based on column headers (Bytes -> KB, Ms -> Seconds)"""
     try:
         if isinstance(val, (int, float)):
-            # Bytes -> KB
-            if any(x in str(key).lower() for x in ['bytes', 'size', 'transfer']):
+            header_lower = str(header_key).lower()
+            
+            # Size / Bytes -> KB
+            if any(x in header_lower for x in ['size', 'bytes', 'transfer']):
                 return f"{val / 1024:.1f} KB"
-            # Milliseconds -> ms
-            if any(x in str(key).lower() for x in ['ms', 'time', 'duration']):
+            
+            # Time / Ms -> Seconds or Ms
+            if any(x in header_lower for x in ['time', 'ms', 'duration', 'wasted']):
+                if val > 1000:
+                    return f"{val/1000:.2f} s"
                 return f"{val:.0f} ms"
+                
     except:
         pass
     return val
@@ -133,57 +133,55 @@ def format_metric_value(key, val):
 def process_audit_details(audit):
     details = audit.get("details", {})
     
-    # --- CASE A: TABLE (Standard lists of files) ---
-    if details.get("items"):
-        items = details.get("items", [])
-        headings = details.get("headings", [])
+    # --- TABLE FORMAT ---
+    if 'items' in details:
+        items = details['items']
+        headings = details.get('headings', [])
         
-        # Fallback headers if missing
-        if not headings and items:
-            headings = [{"key": k, "text": k} for k in items[0].keys()]
-            
-        processed_rows = []
-        for item in items:
-            row = {}
-            for h in headings:
-                key = h.get("key")
-                label = h.get("text")
-                
-                # Get raw value
-                raw_val = item.get(key)
-                
-                # Clean Objects (remove [object Object])
-                clean_val = clean_lighthouse_value(raw_val)
-                
-                # Format Numbers (KB/ms)
-                final_val = format_metric_value(key, clean_val)
-                
-                row[label] = final_val
-            
-            if row: processed_rows.append(row)
-            
-        if processed_rows:
+        if not items: return None
+        
+        # If headings exist, strictly map columns
+        if headings:
+            processed_rows = []
+            for item in items:
+                row = {}
+                for h in headings:
+                    # Get Key and Label
+                    key = h.get('key')
+                    label = h.get('text', h.get('label', str(key))) # Fallback labels
+                    
+                    # Extract raw value using the key
+                    raw_val = item.get(key)
+                    
+                    # Unpack Object
+                    clean_val = safe_extract_value(raw_val)
+                    
+                    # Format Number
+                    formatted_val = format_column(key, clean_val)
+                    
+                    row[label] = formatted_val
+                processed_rows.append(row)
             return pd.DataFrame(processed_rows)
+            
+        # Fallback: No headings, just dump items flatten
+        else:
+            return pd.json_normalize(items)
 
-    # --- CASE B: CRITICAL REQUEST CHAINS (Tree Structure) ---
-    if details.get("type") == "criticalrequestchain":
+    # --- CRITICAL CHAINS (Tree) ---
+    elif details.get("type") == "criticalrequestchain":
         chains = details.get("chains", {})
-        flat_chain = []
-        
-        def traverse(chain, depth=0):
-            for key, node in chain.items():
-                req = node.get("request", {})
-                flat_chain.append({
-                    "Depth": depth,
-                    "Resource URL": req.get("url"),
-                    "Size": f"{req.get('transferSize', 0)/1024:.1f} KB",
-                    "Time": f"{req.get('startTime', 0)*1000:.0f} ms" # Often in seconds
+        flat = []
+        def traverse(node, depth):
+            for k, v in node.items():
+                req = v.get("request", {})
+                flat.append({
+                    "Resource": req.get("url"),
+                    "Transfer": f"{req.get('transferSize',0)/1024:.1f} KB",
+                    "Time": f"{req.get('startTime',0)*1000:.0f} ms"
                 })
-                if "children" in node:
-                    traverse(node["children"], depth+1)
-        
-        traverse(chains)
-        if flat_chain: return pd.DataFrame(flat_chain)
+                if "children" in v: traverse(v["children"], depth+1)
+        traverse(chains, 0)
+        return pd.DataFrame(flat) if flat else None
 
     return None
 
@@ -191,27 +189,31 @@ def get_failed_audits(lighthouse):
     audits = lighthouse.get("audits", {})
     failed = []
     
+    # Priority Order
     for key, audit in audits.items():
         score = audit.get("score")
         
-        # Logic: Fail if Score < 0.9 OR it's a Manual/Diagnostic item with data
-        is_fail = (score is not None and score < 0.9)
-        is_diagnostic = (audit.get("scoreDisplayMode") in ["informative", "manual"])
-        has_table_data = bool(audit.get("details", {}).get("items") or audit.get("details", {}).get("chains"))
+        # We want to see:
+        # 1. Failures (Score < 0.9)
+        # 2. "Informative" items that have data tables (e.g. Diagnostics)
+        # 3. Exclude things with no details
         
-        if is_fail or (is_diagnostic and has_table_data):
+        has_details = bool(audit.get("details", {}).get("items") or audit.get("details", {}).get("chains"))
+        is_bad = (score is not None and score < 0.9)
+        
+        if (is_bad or (score is None and has_details)):
+            # Cleanup Description (Remove Markdown links)
             desc = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', audit.get("description", ""))
             
             failed.append({
-                "id": key,
                 "title": audit.get("title"),
-                "score": score,
+                "score": score if score is not None else 0, # Sort None as 0 (high priority)
                 "displayValue": audit.get("displayValue"),
                 "description": desc,
-                "details_df": process_audit_details(audit)
+                "df": process_audit_details(audit)
             })
             
-    return sorted(failed, key=lambda x: (x['score'] if x['score'] is not None else 1.0))
+    return sorted(failed, key=lambda x: x['score'])
 
 # -----------------------------------------------------------------------------
 # 3. SIDEBAR
@@ -234,7 +236,7 @@ with st.sidebar:
     st.markdown("""
     **Methodology:**
     <div class="tech-note">
-    <b>Forensic Deep Dive:</b> We unwrap Google's nested JSON objects (Chains, Nodes, Source Locations) to show you the exact filenames causing lag.
+    <b>Forensic Deep Dive:</b> We parse the raw Lighthouse JSON objects, unwrapping nested Source Maps and Nodes to reveal the actual file paths.
     </div>
     """, unsafe_allow_html=True)
 
@@ -247,9 +249,9 @@ st.markdown("### Core Web Vitals & Critical Path Analysis")
 
 with st.expander("How this tool differs from Google PSI", expanded=False):
     st.markdown("""
-    **1. Separation of Concerns:** We strictly separate **User Data (CrUX)** from **Lab Simulation**.
-    **2. Deep Extraction:** We unpack nested JSON trees (like Dependency Chains) into readable tables.
-    **3. 3rd Party Attribution:** We highlight external scripts blocking the CPU.
+    **1. Clean Data:** We strip away the confusing "Element" code blocks and give you clean URLs.
+    **2. Smart Formatting:** Bytes are auto-converted to KB. Milliseconds to Seconds.
+    **3. Deep Extraction:** We dig into the "Source Location" objects that standard parsers miss.
     """)
 
 st.write("")
@@ -258,7 +260,7 @@ run_btn = st.button("Run Forensic Audit", type="primary")
 
 if run_btn and url_input:
     
-    with st.spinner(f"Querying Google API ({strategy})... this takes ~15-30s"):
+    with st.spinner(f"Querying Google API ({strategy})..."):
         data, err = run_pagespeed(url_input, strategy, api_key)
         
         if err:
@@ -267,80 +269,48 @@ if run_btn and url_input:
             lh = data.get("lighthouseResult", {})
             crux = parse_crux(data)
             
-            # --- SECTION 1: FIELD DATA ---
+            # --- METRICS ---
             st.markdown("### 1. Real User Experience (CrUX)")
             if crux:
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("LCP (Loading)", f"{crux['LCP']}s", delta_color="off" if crux['LCP']>2.5 else "normal", delta="Target < 2.5s" if crux['LCP']>2.5 else "Good")
-                c2.metric("INP (Responsiveness)", f"{crux['INP']}ms", delta_color="off" if crux['INP']>200 else "normal", delta="Target < 200ms" if crux['INP']>200 else "Good")
-                c3.metric("CLS (Visual Stability)", f"{crux['CLS']}", delta_color="off" if crux['CLS']>0.1 else "normal", delta="Target < 0.1" if crux['CLS']>0.1 else "Good")
-                c4.metric("FCP (First Paint)", f"{crux['FCP']}s")
+                c1.metric("LCP (Loading)", f"{crux['LCP']}s", delta_color="off" if crux['LCP']>2.5 else "normal")
+                c2.metric("INP (Interaction)", f"{crux['INP']}ms", delta_color="off" if crux['INP']>200 else "normal")
+                c3.metric("CLS (Visual)", f"{crux['CLS']}", delta_color="off" if crux['CLS']>0.1 else "normal")
+                c4.metric("FCP (Start)", f"{crux['FCP']}s")
             else:
-                st.info("No Field Data available. The report will rely on Lab Simulation below.")
+                st.info("No Field Data available.")
 
             st.markdown("---")
-            st.markdown("### 2. Lab Simulation Diagnostics")
+            st.markdown("### 2. Forensic Findings (Actionable)")
             
+            # Gauge
             perf_score = lh.get("categories", {}).get("performance", {}).get("score", 0) * 100
-            
-            col_gauge, col_main_metrics = st.columns([1, 3])
-            
-            with col_gauge:
+            col_g, col_txt = st.columns([1, 4])
+            with col_g:
                 fig = go.Figure(go.Indicator(
-                    mode = "gauge+number", value = perf_score, title = {'text': "Performance"},
-                    gauge = {'axis': {'range': [None, 100]}, 'bar': {'color': "#1a7f37" if perf_score >= 90 else "#d93025"}, 'steps': [{'range': [0, 90], 'color': "#f6f8fa"}]}
+                    mode = "gauge+number", value = perf_score,
+                    gauge = {'axis': {'range': [None, 100]}, 'bar': {'color': "#1a7f37" if perf_score >= 90 else "#d93025"}}
                 ))
-                fig.update_layout(height=200, margin=dict(l=20,r=20,t=30,b=20))
+                fig.update_layout(height=150, margin=dict(l=10,r=10,t=10,b=10))
                 st.plotly_chart(fig, use_container_width=True)
-            
-            with col_main_metrics:
-                st.markdown("#### Resource Weight")
-                items = lh.get("audits", {}).get("resource-summary", {}).get("details", {}).get("items", [])
-                if items:
-                    res_df = pd.DataFrame(items)
-                    if 'label' in res_df.columns:
-                        res_df = res_df[res_df['resourceType'] != 'total']
-                        res_df['Size (KB)'] = (res_df['transferSize'] / 1024).round(1)
-                        fig_bar = px.bar(res_df, x='Size (KB)', y='label', orientation='h', text='Size (KB)', color_discrete_sequence=['#24292e'])
-                        fig_bar.update_layout(yaxis={'title': None}, plot_bgcolor='white')
-                        st.plotly_chart(fig_bar, use_container_width=True)
+            with col_txt:
+                st.markdown(f"**Performance Score: {perf_score:.0f}/100**")
+                st.markdown("Issues listed below are sorted by impact. Fixing the top 3 usually resolves 80% of speed problems.")
 
-            # --- SECTION 3: FORENSICS ---
-            st.markdown("### 3. Forensic Findings (Actionable)")
-            st.markdown("""<div class="tech-note">Below are the specific technical failures. 
-            Expand each row to see the exact <b>URLs</b> and <b>File Sizes</b> causing the issue.</div>""", unsafe_allow_html=True)
-            
             failures = get_failed_audits(lh)
             
-            if not failures:
-                st.success("✅ Incredible! No major issues found in the Lab Audit.")
-            
             for fail in failures:
+                # Icon
                 icon = "🔴" if (fail['score'] is not None and fail['score'] < 0.5) else "🟡"
-                if fail['score'] is None: icon = "ℹ️"
+                if fail['score'] == 0 and not fail.get('displayValue'): icon = "ℹ️"
                 
                 label = f"{icon} {fail['title']}"
-                if fail.get('displayValue'):
-                    label += f" — {fail['displayValue']}"
+                if fail.get('displayValue'): label += f" — {fail['displayValue']}"
                 
                 with st.expander(label):
                     st.markdown(f"**Impact:** {fail['description']}")
                     
-                    if fail['details_df'] is not None:
-                        st.dataframe(
-                            fail['details_df'], 
-                            use_container_width=True,
-                            hide_index=True
-                        )
+                    if fail['df'] is not None and not fail['df'].empty:
+                        st.dataframe(fail['df'], use_container_width=True, hide_index=True)
                     else:
-                        st.caption("No specific file breakdown available via API.")
-
-            # --- THIRD PARTY SUMMARY ---
-            st.markdown("### 4. Third-Party Code Impact")
-            tp_audit = lh.get("audits", {}).get("third-party-summary", {})
-            if tp_audit.get("details", {}).get("items"):
-                tp_df = process_audit_details(tp_audit)
-                if tp_df is not None:
-                    st.dataframe(tp_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No significant third-party code detected.")
+                        st.caption("No specific file breakdown available.")
