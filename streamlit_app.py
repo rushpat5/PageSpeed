@@ -12,7 +12,7 @@ st.set_page_config(
     page_title="PageSpeed Forensics", 
     layout="wide", 
     page_icon="⚡",
-    initial_sidebar_state="expanded"  # FIXED: Forces sidebar to be visible
+    initial_sidebar_state="expanded"
 )
 
 st.markdown("""
@@ -42,9 +42,8 @@ st.markdown("""
     /* Tech Note */
     .tech-note { font-size: 0.85rem; color: #57606a; background-color: #f3f4f6; border-left: 3px solid #0969da; padding: 12px; margin-top: 8px; margin-bottom: 15px; border-radius: 0 4px 4px 0; line-height: 1.5; }
 
-    /* Clean UI - Removed 'header' hiding so sidebar toggle remains visible */
-    #MainMenu {visibility: hidden;} 
-    footer {visibility: hidden;} 
+    /* Clean UI */
+    #MainMenu {visibility: hidden;} footer {visibility: hidden;} 
 </style>
 """, unsafe_allow_html=True)
 
@@ -81,53 +80,108 @@ def parse_crux(data):
         "FCP": metrics.get("FIRST_CONTENTFUL_PAINT_MS", {}).get("percentile", 0) / 1000,
     }
 
+def clean_lighthouse_value(val):
+    """
+    Recursively extracts readable text from Lighthouse's complex object structures.
+    Handles: nodes, source-locations, urls, and numerical values.
+    """
+    if val is None:
+        return ""
+    
+    # 1. If it's a Dictionary, assume it's a Lighthouse Object (Node, URL, Source)
+    if isinstance(val, dict):
+        # Type: URL or Link
+        if 'url' in val: 
+            return val['url']
+        # Type: Node (HTML Element) -> Get snippet or selector
+        if 'snippet' in val:
+            return val['snippet']
+        if 'selector' in val:
+            return val['selector']
+        # Type: Source Location (File + Line)
+        if 'source' in val: # sometimes nested
+            return clean_lighthouse_value(val['source'])
+        if 'file' in val:
+            return f"{val['file']} (L{val.get('line',0)})"
+        # Generic Value wrapper
+        if 'value' in val:
+            return str(val['value'])
+        
+        # If unknown dict, try to convert to string representation
+        return str(val)
+
+    # 2. If it's a List, join them
+    if isinstance(val, list):
+        return ", ".join([clean_lighthouse_value(v) for v in val])
+
+    return val
+
+def format_metric_value(key, val):
+    """Formats numbers into KB/ms based on column name."""
+    try:
+        if isinstance(val, (int, float)):
+            # Bytes -> KB
+            if any(x in str(key).lower() for x in ['bytes', 'size', 'transfer']):
+                return f"{val / 1024:.1f} KB"
+            # Milliseconds -> ms
+            if any(x in str(key).lower() for x in ['ms', 'time', 'duration']):
+                return f"{val:.0f} ms"
+    except:
+        pass
+    return val
+
 def process_audit_details(audit):
     details = audit.get("details", {})
-    items = details.get("items", [])
     
-    if items:
+    # --- CASE A: TABLE (Standard lists of files) ---
+    if details.get("items"):
+        items = details.get("items", [])
         headings = details.get("headings", [])
-        if not headings and len(items) > 0:
-            headings = [{"key": k, "text": k} for k in items[0].keys()]
         
+        # Fallback headers if missing
+        if not headings and items:
+            headings = [{"key": k, "text": k} for k in items[0].keys()]
+            
         processed_rows = []
         for item in items:
             row = {}
-            for heading in headings:
-                key = heading.get("key")
-                label = heading.get("text")
-                val = item.get(key)
+            for h in headings:
+                key = h.get("key")
+                label = h.get("text")
                 
-                if isinstance(val, dict):
-                    val = val.get("url", val.get("value", str(val)))
-
-                if val is not None:
-                    if "time" in str(key).lower() or "ms" in str(key).lower():
-                        try: row[label] = f"{float(val):.0f} ms"
-                        except: row[label] = val
-                    elif "bytes" in str(key).lower() or "size" in str(key).lower():
-                        try: row[label] = f"{float(val)/1024:.1f} KB"
-                        except: row[label] = val
-                    else:
-                        row[label] = val
+                # Get raw value
+                raw_val = item.get(key)
+                
+                # Clean Objects (remove [object Object])
+                clean_val = clean_lighthouse_value(raw_val)
+                
+                # Format Numbers (KB/ms)
+                final_val = format_metric_value(key, clean_val)
+                
+                row[label] = final_val
+            
             if row: processed_rows.append(row)
             
-        if processed_rows: return pd.DataFrame(processed_rows)
+        if processed_rows:
+            return pd.DataFrame(processed_rows)
 
+    # --- CASE B: CRITICAL REQUEST CHAINS (Tree Structure) ---
     if details.get("type") == "criticalrequestchain":
         chains = details.get("chains", {})
         flat_chain = []
+        
         def traverse(chain, depth=0):
             for key, node in chain.items():
                 req = node.get("request", {})
                 flat_chain.append({
                     "Depth": depth,
-                    "URL": req.get("url"),
-                    "Transfer Size": f"{req.get('transferSize', 0)/1024:.1f} KB",
-                    "Time Spent": f"{req.get('startTime', 0):.0f} ms"
+                    "Resource URL": req.get("url"),
+                    "Size": f"{req.get('transferSize', 0)/1024:.1f} KB",
+                    "Time": f"{req.get('startTime', 0)*1000:.0f} ms" # Often in seconds
                 })
                 if "children" in node:
                     traverse(node["children"], depth+1)
+        
         traverse(chains)
         if flat_chain: return pd.DataFrame(flat_chain)
 
@@ -139,12 +193,15 @@ def get_failed_audits(lighthouse):
     
     for key, audit in audits.items():
         score = audit.get("score")
-        is_fail = (score is not None and score < 0.9)
-        is_informative = (audit.get("scoreDisplayMode") in ["informative", "manual"])
-        has_items = bool(audit.get("details", {}).get("items"))
         
-        if is_fail or (is_informative and has_items):
+        # Logic: Fail if Score < 0.9 OR it's a Manual/Diagnostic item with data
+        is_fail = (score is not None and score < 0.9)
+        is_diagnostic = (audit.get("scoreDisplayMode") in ["informative", "manual"])
+        has_table_data = bool(audit.get("details", {}).get("items") or audit.get("details", {}).get("chains"))
+        
+        if is_fail or (is_diagnostic and has_table_data):
             desc = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', audit.get("description", ""))
+            
             failed.append({
                 "id": key,
                 "title": audit.get("title"),
@@ -177,7 +234,7 @@ with st.sidebar:
     st.markdown("""
     **Methodology:**
     <div class="tech-note">
-    <b>Forensic Deep Dive:</b> Unlike standard tools, we parse the <b>Critical Request Chains</b> and <b>Diagnostic Tables</b> to find the root cause filename.
+    <b>Forensic Deep Dive:</b> We unwrap Google's nested JSON objects (Chains, Nodes, Source Locations) to show you the exact filenames causing lag.
     </div>
     """, unsafe_allow_html=True)
 
