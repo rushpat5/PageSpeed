@@ -3,58 +3,89 @@ import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import numpy as np
+import re
 
 # -----------------------------------------------------------------------------
-# 1. VISUAL CONFIGURATION (Dejan Style - Light Mode Forced)
+# 1. VISUAL CONFIGURATION (Dejan Style)
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="PageSpeed Forensics", 
     layout="wide", 
-    page_icon="🔬",
+    page_icon="⚡",
     initial_sidebar_state="expanded"
 )
 
 st.markdown("""
 <style>
-    /* --- FORCE LIGHT MODE --- */
+    /* Force Light Mode & Clean Typography */
     :root { --primary-color: #1a7f37; --background-color: #ffffff; --secondary-background-color: #f6f8fa; --text-color: #24292e; --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
     .stApp { background-color: #ffffff; color: #24292e; }
     
-    /* Typography */
-    h1, h2, h3, h4, .markdown-text-container { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #000000 !important; letter-spacing: -0.3px; }
+    h1, h2, h3, h4 { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #000000 !important; letter-spacing: -0.3px; }
     p, li, span, div { color: #24292e; }
     a { color: #0969da; text-decoration: none; }
     
-    /* Sidebar */
-    section[data-testid="stSidebar"] { background-color: #f6f8fa; border-right: 1px solid #d0d7de; }
-    section[data-testid="stSidebar"] * { color: #24292e !important; }
-    
-    /* Inputs */
-    .stTextInput input { background-color: #ffffff !important; border: 1px solid #d0d7de !important; color: #24292e !important; border-radius: 6px; }
-    .stTextInput input:focus { border-color: #1a7f37 !important; box-shadow: 0 0 0 2px rgba(26,127,55,0.1) !important; }
-    
-    /* Custom Metric Cards */
+    /* Custom Components */
     .metric-card {
         background: #ffffff; border: 1px solid #e1e4e8; border-radius: 8px; padding: 20px; text-align: center;
         box-shadow: 0 1px 3px rgba(0,0,0,0.02); margin-bottom: 10px;
     }
     .metric-val { font-size: 1.8rem; font-weight: 700; color: #1a7f37; }
     .metric-lbl { font-size: 0.85rem; color: #586069; text-transform: uppercase; letter-spacing: 0.5px; }
-    .metric-bad { color: #d73a49; }
     
-    /* Tables */
-    [data-testid="stDataFrame"] { border: 1px solid #e1e4e8; border-radius: 6px; }
+    /* Code Snippet Box */
+    .code-box {
+        background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: 10px;
+        font-family: monospace; font-size: 0.85rem; color: #cf222e; margin: 10px 0;
+    }
     
-    /* Tech Note */
-    .tech-note { font-size: 0.85rem; color: #57606a; background-color: #f6f8fa; border-left: 3px solid #0969da; padding: 12px; border-radius: 0 4px 4px 0; }
+    /* Sidebar & Inputs */
+    section[data-testid="stSidebar"] { background-color: #f6f8fa; border-right: 1px solid #d0d7de; }
+    .stTextInput input { background-color: #ffffff !important; border: 1px solid #d0d7de !important; color: #24292e !important; }
     
+    /* Hide Streamlit elements */
     #MainMenu {visibility: hidden;} footer {visibility: hidden;} 
 </style>
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. ENGINE: DATA EXTRACTION
+# 2. KNOWLEDGE BASE (THE "HOW TO FIX" ENGINE)
+# -----------------------------------------------------------------------------
+
+AUDIT_GUIDES = {
+    "unused-css-rules": """
+    **🛠️ The Fix:**
+    1.  **Split CSS:** Don't load one giant `style.css`. Split it into `critical.css` (header/hero) and `footer.css`.
+    2.  **Remove Libraries:** Are you loading all of Bootstrap but only using the grid? Switch to Tailwind or custom Flexbox.
+    3.  **Code Snippet:** Use `coverage` tool in Chrome DevTools to identify red lines (unused bytes).
+    """,
+    "unused-javascript": """
+    **🛠️ The Fix:**
+    1.  **Code Splitting:** Use Webpack/Vite to split bundles. Only load JS needed for the current route.
+    2.  **Defer:** Add `defer` attribute to non-critical scripts.
+    3.  **Lazy Load:** Don't load Chatbots or Analytics until the user scrolls.
+    """,
+    "modern-image-formats": """
+    **🛠️ The Fix:**
+    1.  **Convert:** Change PNG/JPG to **WebP** or **AVIF**.
+    2.  **Automation:** Use a CDN (Cloudflare/Cloudinary) or a WordPress plugin (Smush/Imagify) to do this automatically.
+    """,
+    "render-blocking-resources": """
+    **🛠️ The Fix:**
+    1.  **Inlining:** Inline Critical CSS (First 1000px of page) into the `<head>`.
+    2.  **Defer:** `<script src="..." defer></script>`
+    3.  **Async:** `<link rel="stylesheet" href="..." media="print" onload="this.media='all'">`
+    """,
+    "server-response-time": """
+    **🛠️ The Fix:**
+    1.  **Cache:** Implement Redis/Varnish caching on the server.
+    2.  **Database:** Check slow SQL queries.
+    3.  **CDN:** Ensure your HTML document isn't being generated from scratch on every visit (TTFB).
+    """
+}
+
+# -----------------------------------------------------------------------------
+# 3. LOGIC ENGINE
 # -----------------------------------------------------------------------------
 
 def run_pagespeed(url, strategy, api_key=None):
@@ -69,82 +100,90 @@ def run_pagespeed(url, strategy, api_key=None):
         else:
             try: err = response.json().get('error', {}).get('message', 'Unknown error')
             except: err = f"Status {response.status_code}"
-            return None, f"Google API Error: {err}"
+            return None, f"API Error: {err}"
     except Exception as e:
-        return None, f"Connection Error: {str(e)}"
+        return None, str(e)
 
-def get_network_data(lighthouse):
-    """Extracts resource data safely for visualization."""
-    items = lighthouse.get("audits", {}).get("network-requests", {}).get("details", {}).get("items", [])
-    if not items: return None
+def parse_crux(data):
+    metrics = data.get("loadingExperience", {}).get("metrics", {})
+    if not metrics: return None
+    return {
+        "LCP": metrics.get("LARGEST_CONTENTFUL_PAINT_MS", {}).get("percentile", 0) / 1000,
+        "INP": metrics.get("INTERACTION_TO_NEXT_PAINT", {}).get("percentile", 0),
+        "CLS": metrics.get("CUMULATIVE_LAYOUT_SHIFT_SCORE", {}).get("percentile", 0) / 100,
+        "FCP": metrics.get("FIRST_CONTENTFUL_PAINT_MS", {}).get("percentile", 0) / 1000,
+    }
+
+def get_lcp_element(lighthouse):
+    """Finds the exact HTML element causing LCP."""
+    audit = lighthouse.get("audits", {}).get("largest-contentful-paint-element", {})
+    details = audit.get("details", {})
+    if details.get("items"):
+        item = details["items"][0]
+        node = item.get("node", {})
+        return {
+            "Score": audit.get("displayValue"),
+            "Snippet": node.get("snippet", "Unknown"),
+            "Selector": node.get("selector", "Unknown"),
+            "NodeLabel": node.get("nodeLabel", "Unknown")
+        }
+    return None
+
+def process_opportunity(audit):
+    """
+    Extracts the specific file table for a failed audit.
+    """
+    details = audit.get("details", {})
+    if not details or "items" not in details:
+        return None, 0
+
+    items = details["items"]
+    # Sum up potential savings if available
+    total_savings = audit.get("details", {}).get("overallSavingsBytes", 0)
     
-    # Process explicitly to avoid KeyErrors
-    processed_items = []
+    # Process rows
+    processed = []
     for item in items:
-        url = item.get('url', '')
-        mime = str(item.get('mimeType', ''))
+        row = {}
+        # Extract URL
+        if "url" in item: row["File"] = item["url"]
+        elif "source" in item and "url" in item["source"]: row["File"] = item["source"]["url"]
+        else: row["File"] = str(item.get("label", "Unknown resource"))
         
-        # Categorize
-        cat = "Other"
-        if 'image' in mime: cat = "Images"
-        elif 'script' in mime or '.js' in url: cat = "JavaScript"
-        elif 'css' in mime: cat = "CSS"
-        elif 'font' in mime: cat = "Fonts"
-        elif 'html' in mime: cat = "HTML"
-        elif 'json' in mime: cat = "Data/XHR"
+        # Extract Size
+        if "totalBytes" in item: row["Size"] = f"{item['totalBytes']/1024:.1f} KB"
+        elif "transferSize" in item: row["Size"] = f"{item['transferSize']/1024:.1f} KB"
         
-        processed_items.append({
-            "Category": cat,
-            "URL": url,
-            "Size": item.get('transferSize', 0),
-            "Start Time": item.get('startTime', 0),
-            "Duration": item.get('endTime', 0) - item.get('startTime', 0)
-        })
+        # Extract Wasted/Savings
+        if "wastedBytes" in item: row["Wasted"] = f"{item['wastedBytes']/1024:.1f} KB"
+        elif "wastedMs" in item: row["Delay"] = f"{item['wastedMs']:.0f} ms"
         
-    df = pd.DataFrame(processed_items)
-    # Filter out 0 byte requests (cached or failed)
-    df = df[df['Size'] > 0]
-    return df
+        processed.append(row)
+        
+    return pd.DataFrame(processed), total_savings
 
-def get_js_execution(lighthouse):
-    """Parses Main Thread Work breakdown."""
-    items = lighthouse.get("audits", {}).get("mainthread-work-breakdown", {}).get("details", {}).get("items", [])
-    if not items: return None
-    df = pd.DataFrame(items)
-    df['duration'] = df['duration'].round(0)
-    return df.sort_values('duration', ascending=False)
-
-def get_third_party(lighthouse):
-    """Aggregates Third Party usage."""
-    items = lighthouse.get("audits", {}).get("third-party-summary", {}).get("details", {}).get("items", [])
-    if not items: return None
-    
-    data = []
-    for item in items:
-        # Extract subItems (specific URLs) to count them
-        count = len(item.get('subItems', {}).get('items', []))
-        data.append({
-            "Entity": item.get('entity', {}).get('text', 'Unknown'),
-            "Transfer Size (KB)": item.get('transferSize', 0) / 1024,
-            "Blocking Time (ms)": item.get('blockingTime', 0),
-            "Request Count": count
-        })
-    return pd.DataFrame(data).sort_values('Blocking Time (ms)', ascending=False)
-
-def get_opportunities(lighthouse):
-    """Filters only the audits that show BYTE savings."""
+def get_actionable_audits(lighthouse):
     audits = lighthouse.get("audits", {})
-    opps = []
-    for key, val in audits.items():
-        if val.get('details', {}).get('type') == 'opportunity' and val.get('score', 1) < 0.9:
-            savings = val.get('details', {}).get('overallSavingsBytes', 0)
-            if savings > 0:
-                opps.append({
-                    "Optimization": val.get('title'),
-                    "Potential Savings (KB)": savings / 1024,
-                    "Description": val.get('description').split('[')[0] # Remove links
+    actionable = []
+    
+    for key, audit in audits.items():
+        # Only care if it has a score < 0.9 AND has a details table
+        if audit.get("score") is not None and audit.get("score") < 0.9:
+            df, savings = process_opportunity(audit)
+            
+            # If we successfully extracted a table of files
+            if df is not None and not df.empty:
+                actionable.append({
+                    "id": key,
+                    "title": audit.get("title"),
+                    "score": audit.get("score"),
+                    "savings_bytes": savings,
+                    "description": audit.get("description").split('[')[0], # Clean markdown
+                    "data": df
                 })
-    return pd.DataFrame(opps).sort_values('Potential Savings (KB)', ascending=False)
+    
+    # Sort by impact (lowest score first)
+    return sorted(actionable, key=lambda x: x['score'])
 
 # -----------------------------------------------------------------------------
 # 3. SIDEBAR CONFIG
@@ -164,14 +203,8 @@ with st.sidebar:
     api_key = st.text_input("Google API Key", type="password", help="Prevent 429 Errors")
     
     st.markdown("---")
-    st.markdown("### 📚 Methodology")
-    st.markdown("""
-    **1. Payload:** Breakdown of what your users are actually downloading.
-    
-    **2. Thread Blocking:** Analysis of JavaScript CPU cost.
-    
-    **3. Third-Party:** Latency cost of external vendors.
-    """)
+    st.markdown("### 📚 Guide")
+    st.info("This tool provides specific file paths and coding advice. Use the 'Developer Action Plan' below to assign tasks to your engineering team.")
 
 # -----------------------------------------------------------------------------
 # 4. MAIN DASHBOARD
@@ -180,7 +213,6 @@ with st.sidebar:
 st.title("PageSpeed Forensics")
 st.markdown("### The Developer's Performance Audit")
 
-# Input Section
 col_in1, col_in2 = st.columns([3, 1])
 with col_in1:
     url_input = st.text_input("Target URL", placeholder="https://example.com", label_visibility="collapsed")
@@ -188,160 +220,97 @@ with col_in2:
     run_btn = st.button("Start Forensic Audit", type="primary", use_container_width=True)
 
 if run_btn and url_input:
-    with st.spinner("Connecting to Lighthouse Infrastructure..."):
+    with st.spinner("Connecting to Google Lighthouse Infrastructure..."):
         data, err = run_pagespeed(url_input, strategy, api_key)
         
     if err:
         st.error(err)
     else:
         lh = data.get("lighthouseResult", {})
+        crux = parse_crux(data)
         
-        # --- PART 1: CORE VITALS HUD ---
-        st.markdown("### 1. Vitals HUD (Real User Data)")
+        # --- 1. THE SCORECARD ---
+        st.subheader("1. Core Vitals Scorecard")
         
-        crux = data.get("loadingExperience", {}).get("metrics", {})
         if crux:
             c1, c2, c3, c4 = st.columns(4)
             
-            # Helper to render cards
-            def render_card(col, label, val, unit, threshold):
-                is_bad = val > threshold
-                color_class = "metric-bad" if is_bad else "metric-val"
+            def metric_box(col, label, val, unit, good_limit, bad_limit):
+                color = "#1a7f37" # Green
+                if val > bad_limit: color = "#d73a49" # Red
+                elif val > good_limit: color = "#d29922" # Orange
+                
                 col.markdown(f"""
-                <div class="metric-card">
-                    <div class="{color_class}">{val}{unit}</div>
+                <div class="metric-card" style="border-top: 4px solid {color}">
+                    <div class="metric-val" style="color: {color}">{val}{unit}</div>
                     <div class="metric-lbl">{label}</div>
                 </div>
                 """, unsafe_allow_html=True)
 
-            lcp = crux.get('LARGEST_CONTENTFUL_PAINT_MS', {}).get('percentile', 0) / 1000
-            inp = crux.get('INTERACTION_TO_NEXT_PAINT', {}).get('percentile', 0)
-            cls = crux.get('CUMULATIVE_LAYOUT_SHIFT_SCORE', {}).get('percentile', 0) / 100
-            fcp = crux.get('FIRST_CONTENTFUL_PAINT_MS', {}).get('percentile', 0) / 1000
-            
-            render_card(c1, "LCP (Load)", lcp, "s", 2.5)
-            render_card(c2, "INP (Lag)", inp, "ms", 200)
-            render_card(c3, "CLS (Shift)", cls, "", 0.1)
-            render_card(c4, "FCP (Paint)", fcp, "s", 1.8)
+            metric_box(c1, "LCP (Loading)", crux['LCP'], "s", 2.5, 4.0)
+            metric_box(c2, "INP (Lag)", crux['INP'], "ms", 200, 500)
+            metric_box(c3, "CLS (Shift)", crux['CLS'], "", 0.1, 0.25)
+            metric_box(c4, "FCP (First Paint)", crux['FCP'], "s", 1.8, 3.0)
         else:
-            st.info("No Field Data (CrUX) available. Showing Lab Data only.")
+            st.info("No Field Data (CrUX) available for this URL. Showing Lab Data below.")
 
-        # --- PART 2: PAYLOAD VISUALIZATION (Clean) ---
-        st.markdown("---")
-        st.subheader("2. Payload Anatomy")
-        
-        network_df = get_network_data(lh)
-        
-        if network_df is not None and not network_df.empty:
-            col_chart1, col_chart2 = st.columns(2)
+        # --- 2. LCP FORENSICS (The specific element) ---
+        lcp_data = get_lcp_element(lh)
+        if lcp_data:
+            st.markdown("---")
+            st.subheader("2. What is slowing down your load? (LCP)")
+            col_lcp1, col_lcp2 = st.columns([1, 2])
             
-            with col_chart1:
-                st.markdown("#### Weight Distribution")
-                # Group by Category
-                cat_df = network_df.groupby('Category')['Size'].sum().reset_index()
-                
-                fig = px.pie(cat_df, values='Size', names='Category', hole=0.4,
-                             color_discrete_sequence=px.colors.qualitative.Pastel)
-                st.plotly_chart(fig, use_container_width=True)
-                
-            with col_chart2:
-                st.markdown("#### Top 5 Heavy Files")
-                top_files = network_df.sort_values('Size', ascending=False).head(5)
-                # Truncate long URLs for display
-                top_files['Short URL'] = top_files['URL'].apply(lambda x: x.split('/')[-1][:30] + '...' if len(x.split('/')[-1]) > 30 else x.split('/')[-1])
-                top_files['Size (KB)'] = (top_files['Size']/1024).round(1)
-                
-                fig_bar = px.bar(top_files, x='Size (KB)', y='Short URL', orientation='h',
-                                 text='Size (KB)', color='Category')
-                fig_bar.update_layout(yaxis={'title': None})
-                st.plotly_chart(fig_bar, use_container_width=True)
+            with col_lcp1:
+                st.markdown(f"**LCP Time:** {lcp_data['Score']}")
+                st.markdown("**The Culprit:** This specific element is the last thing to paint.")
+            
+            with col_lcp2:
+                st.markdown("##### The LCP Element Code:")
+                st.code(lcp_data['Snippet'], language="html")
+                st.caption(f"Selector: {lcp_data['Selector']}")
 
-            # Raw Data Table
-            with st.expander("View Full Asset List"):
-                st.dataframe(
-                    network_df[['Category', 'Size', 'URL']].sort_values('Size', ascending=False),
-                    column_config={
-                        "Size": st.column_config.NumberColumn("Size (Bytes)", format="%d"),
-                        "URL": st.column_config.LinkColumn("Asset Link")
-                    },
-                    use_container_width=True
-                )
-
-        # --- PART 3: MAIN THREAD BLOCKERS ---
+        # --- 3. DEVELOPER ACTION PLAN (The Fixes) ---
         st.markdown("---")
-        col_js, col_3rd = st.columns(2)
+        st.subheader("3. Developer Action Plan")
+        st.markdown("These are specific, prioritized fixes based on file analysis.")
         
-        with col_js:
-            st.subheader("3. JavaScript Execution Cost")
-            js_df = get_js_execution(lh)
-            if js_df is not None:
-                fig_js = px.bar(
-                    js_df, x='duration', y='group', orientation='h',
-                    text='duration', color='duration',
-                    color_continuous_scale=['#a5d6a7', '#ef5350'],
-                    labels={'duration': 'Time (ms)', 'group': 'Task Type'}
-                )
-                fig_js.update_layout(yaxis={'categoryorder':'total ascending'}, plot_bgcolor='white')
-                st.plotly_chart(fig_js, use_container_width=True)
-                st.caption("What is the CPU doing? 'Script Evaluation' = Heavy frameworks.")
-
-        with col_3rd:
-            st.subheader("4. Third-Party Wall of Shame")
-            tp_df = get_third_party(lh)
-            if tp_df is not None:
+        actions = get_actionable_audits(lh)
+        
+        if not actions:
+            st.success("✅ Clean Audit! No major technical debt found.")
+        
+        for act in actions:
+            # Determine icon color
+            icon = "🔴" if act['score'] < 0.5 else "🟡"
+            
+            # Label
+            label = f"{icon} {act['title']}"
+            if act['savings_bytes'] > 0:
+                label += f" (Save {act['savings_bytes']/1024:.0f} KB)"
+            
+            with st.expander(label):
+                # 1. The Description
+                st.markdown(f"**Impact:** {act['description']}")
+                
+                # 2. The Custom Fix Guide (If available)
+                if act['id'] in AUDIT_GUIDES:
+                    st.markdown(f"<div class='code-box'>{AUDIT_GUIDES[act['id']]}</div>", unsafe_allow_html=True)
+                
+                # 3. The Evidence Table
+                st.markdown("**Files causing this issue:**")
                 st.dataframe(
-                    tp_df,
+                    act['data'], 
+                    use_container_width=True, 
+                    hide_index=True,
                     column_config={
-                        "Blocking Time (ms)": st.column_config.ProgressColumn(
-                            "Blocking Impact", 
-                            format="%d ms", 
+                        "File": st.column_config.LinkColumn("Resource URL"),
+                        "Size": st.column_config.TextColumn("Size"),
+                        "Wasted": st.column_config.ProgressColumn(
+                            "Wasted Bytes", 
+                            format="%s", 
                             min_value=0, 
-                            max_value=int(tp_df['Blocking Time (ms)'].max() + 100)
-                        ),
-                        "Transfer Size (KB)": st.column_config.NumberColumn("Size (KB)", format="%.1f")
-                    },
-                    use_container_width=True,
-                    height=400
-                )
-            else:
-                st.success("Clean! No blocking third-party scripts detected.")
-
-        # --- PART 5: DEVELOPER ACTION PLAN ---
-        st.markdown("---")
-        st.subheader("5. Developer Action Plan")
-        
-        opps_df = get_opportunities(lh)
-        
-        if not opps_df.empty:
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                st.dataframe(
-                    opps_df,
-                    column_config={
-                        "Potential Savings (KB)": st.column_config.ProgressColumn(
-                            "Projected Savings",
-                            format="%.1f KB",
-                            min_value=0,
-                            max_value=int(opps_df['Potential Savings (KB)'].max())
+                            max_value=int(act['data']['Wasted'].str.replace(' KB','').astype(float).max() if 'Wasted' in act['data'] else 100)
                         )
-                    },
-                    use_container_width=True,
-                    hide_index=True
+                    }
                 )
-            with col2:
-                # Calculate Total Savings
-                total_save = opps_df['Potential Savings (KB)'].sum()
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-val">{total_save:.1f} KB</div>
-                    <div class="metric-lbl">Total Waste Identified</div>
-                </div>
-                <div style="font-size:0.9rem; color:#586069; margin-top:10px;">
-                <b>Quick Wins:</b><br>
-                1. Compress Images (WebP)<br>
-                2. Defer off-screen assets<br>
-                3. Minify JS/CSS
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.success("No major resource optimizations found. Good job!")
