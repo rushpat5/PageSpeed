@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import numpy as np
 
 # -----------------------------------------------------------------------------
-# 1. VISUAL CONFIGURATION (Strict "Dejan" Academic Minimalist)
+# 1. VISUAL CONFIGURATION (Dejan Style - Light Mode Forced)
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="PageSpeed Forensics", 
@@ -54,7 +54,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. ENGINE: DATA EXTRACTION & PROCESSING
+# 2. ENGINE: DATA EXTRACTION
 # -----------------------------------------------------------------------------
 
 def run_pagespeed(url, strategy, api_key=None):
@@ -73,27 +73,36 @@ def run_pagespeed(url, strategy, api_key=None):
     except Exception as e:
         return None, f"Connection Error: {str(e)}"
 
-def get_treemap_data(lighthouse):
-    """Extracts resource data for the Treemap visualization."""
+def get_network_data(lighthouse):
+    """Extracts resource data safely for visualization."""
     items = lighthouse.get("audits", {}).get("network-requests", {}).get("details", {}).get("items", [])
     if not items: return None
     
-    df = pd.DataFrame(items)
-    # Categorize by resource type
-    def categorize(mime, url):
-        if 'image' in mime: return "Images"
-        if 'script' in mime or '.js' in url: return "JavaScript"
-        if 'css' in mime: return "CSS"
-        if 'font' in mime: return "Fonts"
-        if 'html' in mime: return "HTML"
-        if 'json' in mime: return "Data/XHR"
-        return "Other"
-
-    df['Category'] = df.apply(lambda x: categorize(str(x.get('mimeType', '')), x.get('url', '')), axis=1)
-    df['Size'] = df['transferSize']
-    df['Label'] = df['url'].apply(lambda x: x.split('/')[-1].split('?')[0] if x else 'Unknown')
-    
-    # Filter out 0 byte requests
+    # Process explicitly to avoid KeyErrors
+    processed_items = []
+    for item in items:
+        url = item.get('url', '')
+        mime = str(item.get('mimeType', ''))
+        
+        # Categorize
+        cat = "Other"
+        if 'image' in mime: cat = "Images"
+        elif 'script' in mime or '.js' in url: cat = "JavaScript"
+        elif 'css' in mime: cat = "CSS"
+        elif 'font' in mime: cat = "Fonts"
+        elif 'html' in mime: cat = "HTML"
+        elif 'json' in mime: cat = "Data/XHR"
+        
+        processed_items.append({
+            "Category": cat,
+            "URL": url,
+            "Size": item.get('transferSize', 0),
+            "Start Time": item.get('startTime', 0),
+            "Duration": item.get('endTime', 0) - item.get('startTime', 0)
+        })
+        
+    df = pd.DataFrame(processed_items)
+    # Filter out 0 byte requests (cached or failed)
     df = df[df['Size'] > 0]
     return df
 
@@ -157,11 +166,11 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 📚 Methodology")
     st.markdown("""
-    **1. Payload Anatomy:** We use Treemaps to visualize asset weight distribution.
+    **1. Payload:** Breakdown of what your users are actually downloading.
     
-    **2. Thread Blocking:** We analyze the JS Execution timeline to find CPU hogs.
+    **2. Thread Blocking:** Analysis of JavaScript CPU cost.
     
-    **3. Third-Party Cost:** We sum up the latency tax paid to vendors (Meta, Google, etc).
+    **3. Third-Party:** Latency cost of external vendors.
     """)
 
 # -----------------------------------------------------------------------------
@@ -217,37 +226,43 @@ if run_btn and url_input:
         else:
             st.info("No Field Data (CrUX) available. Showing Lab Data only.")
 
-        # --- PART 2: PAYLOAD TREEMAP (The Killer Feature) ---
+        # --- PART 2: PAYLOAD VISUALIZATION (Clean) ---
         st.markdown("---")
-        st.subheader("2. Payload Anatomy (Treemap)")
-        st.markdown("This visualization answers: **'What is taking up all the space?'** Click headers to zoom in.")
+        st.subheader("2. Payload Anatomy")
         
-        network_df = get_treemap_data(lh)
+        network_df = get_network_data(lh)
         
         if network_df is not None and not network_df.empty:
-            fig = px.treemap(
-                network_df, 
-                path=[px.Constant("Total Page Size"), 'Category', 'Label'], 
-                values='Size',
-                color='Category',
-                color_discrete_map={
-                    'Images': '#e3f2fd', 'JavaScript': '#fff9c4', 'CSS': '#e8f5e9', 
-                    'Fonts': '#f3e5f5', 'HTML': '#ffebee', 'Other': '#f5f5f5'
-                },
-                hover_data=['url']
-            )
-            fig.update_layout(margin=dict(t=0, l=0, r=0, b=0))
-            fig.update_traces(textinfo="label+value+percent entry")
-            st.plotly_chart(fig, use_container_width=True)
+            col_chart1, col_chart2 = st.columns(2)
             
-            # Stats Table
-            with st.expander("View Raw Asset List (Searchable)"):
+            with col_chart1:
+                st.markdown("#### Weight Distribution")
+                # Group by Category
+                cat_df = network_df.groupby('Category')['Size'].sum().reset_index()
+                
+                fig = px.pie(cat_df, values='Size', names='Category', hole=0.4,
+                             color_discrete_sequence=px.colors.qualitative.Pastel)
+                st.plotly_chart(fig, use_container_width=True)
+                
+            with col_chart2:
+                st.markdown("#### Top 5 Heavy Files")
+                top_files = network_df.sort_values('Size', ascending=False).head(5)
+                # Truncate long URLs for display
+                top_files['Short URL'] = top_files['URL'].apply(lambda x: x.split('/')[-1][:30] + '...' if len(x.split('/')[-1]) > 30 else x.split('/')[-1])
+                top_files['Size (KB)'] = (top_files['Size']/1024).round(1)
+                
+                fig_bar = px.bar(top_files, x='Size (KB)', y='Short URL', orientation='h',
+                                 text='Size (KB)', color='Category')
+                fig_bar.update_layout(yaxis={'title': None})
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+            # Raw Data Table
+            with st.expander("View Full Asset List"):
                 st.dataframe(
-                    network_df[['Category', 'Label', 'Size', 'startTime', 'url']].sort_values('Size', ascending=False),
+                    network_df[['Category', 'Size', 'URL']].sort_values('Size', ascending=False),
                     column_config={
                         "Size": st.column_config.NumberColumn("Size (Bytes)", format="%d"),
-                        "startTime": st.column_config.NumberColumn("Start Time (ms)", format="%d"),
-                        "url": st.column_config.LinkColumn("Full URL")
+                        "URL": st.column_config.LinkColumn("Asset Link")
                     },
                     use_container_width=True
                 )
@@ -268,7 +283,7 @@ if run_btn and url_input:
                 )
                 fig_js.update_layout(yaxis={'categoryorder':'total ascending'}, plot_bgcolor='white')
                 st.plotly_chart(fig_js, use_container_width=True)
-                st.caption("This shows *what* the browser CPU is doing. 'Script Evaluation' usually means heavy JS frameworks.")
+                st.caption("What is the CPU doing? 'Script Evaluation' = Heavy frameworks.")
 
         with col_3rd:
             st.subheader("4. Third-Party Wall of Shame")
@@ -322,10 +337,10 @@ if run_btn and url_input:
                     <div class="metric-lbl">Total Waste Identified</div>
                 </div>
                 <div style="font-size:0.9rem; color:#586069; margin-top:10px;">
-                <b>Strategy:</b><br>
+                <b>Quick Wins:</b><br>
                 1. Compress Images (WebP)<br>
-                2. Defer off-screen images<br>
-                3. Minify CSS/JS
+                2. Defer off-screen assets<br>
+                3. Minify JS/CSS
                 </div>
                 """, unsafe_allow_html=True)
         else:
