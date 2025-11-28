@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import re
 
 # -----------------------------------------------------------------------------
-# 1. VISUAL CONFIGURATION
+# 1. VISUAL CONFIGURATION (Dejan Style - Light Mode Forced)
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="PageSpeed Forensics", 
@@ -17,6 +17,7 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+    /* --- FORCE LIGHT MODE --- */
     :root { --primary-color: #1a7f37; --background-color: #ffffff; --secondary-background-color: #f6f8fa; --text-color: #24292e; --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
     .stApp { background-color: #ffffff; color: #24292e; }
     h1, h2, h3, h4, .markdown-text-container { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #000000 !important; letter-spacing: -0.3px; }
@@ -35,7 +36,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 2. THE "NUCLEAR" PARSER (Fixes all object/json issues)
+# 2. LOGIC ENGINE
 # -----------------------------------------------------------------------------
 
 def run_pagespeed(url, strategy, api_key=None):
@@ -64,110 +65,111 @@ def parse_crux(data):
         "FCP": metrics.get("FIRST_CONTENTFUL_PAINT_MS", {}).get("percentile", 0) / 1000,
     }
 
-def recursive_clean(val):
+# --- THE SCHEMA-AWARE PARSER ---
+def format_lighthouse_value(val, value_type):
     """
-    The 'Universal Unpacker'. It recursively digs into dictionaries
-    to find the single string or number that matters.
+    Formats a single cell based on Lighthouse's official 'valueType' metadata.
     """
     if val is None: return ""
     
-    if isinstance(val, dict):
-        # Priority 1: URLs
-        if 'url' in val: return val['url']
-        # Priority 2: HTML Snippets (Nodes)
-        if 'snippet' in val: return val['snippet']
-        if 'selector' in val: return val['selector']
-        # Priority 3: Source Locations
-        if 'source' in val: return recursive_clean(val['source'])
-        if 'file' in val: return f"{val.get('file','')} (L{val.get('line',0)})"
-        # Priority 4: Generic Values
-        if 'value' in val: return str(val['value'])
-        # Priority 5: Labels
-        if 'label' in val: return val['label']
+    # 1. BYTES (File Sizes)
+    if value_type == 'bytes':
+        try: return f"{float(val)/1024:.1f} KB"
+        except: return str(val)
         
-        # Fallback: Join all string values
-        return " ".join([str(v) for k,v in val.items() if isinstance(v, (str, int, float))])
-
-    if isinstance(val, list):
-        return ", ".join([str(recursive_clean(v)) for v in val])
-
-    return val
-
-def format_cell(key, val):
-    """Auto-formats numbers based on the column key."""
-    clean_val = recursive_clean(val)
+    # 2. TIME (Durations)
+    if value_type == 'timespanMs':
+        try: return f"{float(val):.0f} ms"
+        except: return str(val)
+        
+    # 3. URL (Links)
+    if value_type == 'url':
+        return str(val)
+        
+    # 4. NODE (HTML Elements)
+    if value_type == 'node':
+        if isinstance(val, dict):
+            return val.get('snippet') or val.get('selector') or val.get('nodeLabel') or "[Element]"
+        return str(val)
+        
+    # 5. SOURCE LOCATION (Code Files)
+    if value_type == 'source-location':
+        if isinstance(val, dict):
+            url = val.get('url', 'Unknown')
+            line = val.get('line', 0)
+            col = val.get('column', 0)
+            return f"{url}:{line}:{col}"
+        return str(val)
     
-    # Try to keep numbers as numbers for sorting, unless they need units
-    try:
-        num_val = float(clean_val)
-        lower_key = str(key).lower()
-        
-        # Bytes -> KB
-        if any(x in lower_key for x in ['bytes', 'size', 'transfer']):
-            return f"{num_val / 1024:.1f} KB"
-        
-        # Milliseconds -> Sec/ms
-        if any(x in lower_key for x in ['time', 'ms', 'duration', 'wasted']):
-            if num_val >= 1000: return f"{num_val/1000:.2f} s"
-            return f"{num_val:.0f} ms"
-            
-        return num_val # Return plain number if no unit detected
-    except:
-        return clean_val # Return text
+    # 6. TEXT / NUMERIC / THUMBNAIL
+    if value_type == 'thumbnail': return "(Image)"
+    
+    # 7. CODE (Inline)
+    if value_type == 'code':
+        if isinstance(val, dict): return val.get('value', str(val))
+        return str(val)
+
+    # Fallback for simple strings/numbers
+    if isinstance(val, dict) and 'value' in val: return str(val['value'])
+    return str(val)
 
 def process_audit_details(audit):
     details = audit.get("details", {})
     
-    # --- TABLE MODE ---
+    # --- TYPE A: STANDARD TABLE ---
     if 'items' in details:
-        raw_items = details['items']
+        items = details['items']
         headings = details.get('headings', [])
         
-        if not raw_items: return None
+        if not items: return None
         
-        # 1. Map Headers {key: "Human Label"}
-        header_map = {}
+        # 1. Build a Header Map: key -> {label, valueType}
+        # This tells us HOW to format each column
+        schema = {}
         if headings:
             for h in headings:
-                # IMPORTANT: 'text' is sometimes nested? No, usually 'text' or 'label'
-                label = h.get('text', h.get('label', h.get('key')))
-                header_map[h.get('key')] = str(label)
+                key = h.get('key')
+                label = h.get('text', h.get('label', key))
+                v_type = h.get('valueType', 'text') # Default to text
+                schema[key] = {'label': label, 'type': v_type}
         else:
-            # Auto-gen headers if missing
-            for k in raw_items[0].keys():
-                header_map[k] = k.replace('rtt', 'RTT').title()
+            # Fallback if no headers
+            for k in items[0].keys():
+                schema[k] = {'label': k, 'type': 'text'}
 
         processed_rows = []
         
-        for item in raw_items:
+        for item in items:
             row = {}
-            # Main Item Processing
-            for key, label in header_map.items():
-                val = item.get(key)
-                row[label] = format_cell(key, val)
+            for key, meta in schema.items():
+                raw_val = item.get(key)
+                
+                # The Magic: Format using the Schema Type
+                formatted_val = format_lighthouse_value(raw_val, meta['type'])
+                
+                row[meta['label']] = formatted_val
             
-            # SUB-ITEMS (The hidden "Grouped" data)
-            if 'subItems' in item and item['subItems']:
-                # Add the parent row
-                processed_rows.append(row)
-                # Add children rows with indentation
+            # SUB-ITEMS (Nested rows like in "Main Thread Work")
+            if 'subItems' in item and item['subItems'].get('items'):
+                processed_rows.append(row) # Add Parent
                 for sub in item['subItems']['items']:
                     sub_row = {}
-                    for key, label in header_map.items():
-                        val = sub.get(key)
-                        formatted = format_cell(key, val)
-                        # Indent the first column to show hierarchy
-                        if key == list(header_map.keys())[0]:
-                            sub_row[label] = f" ↳ {formatted}"
+                    for key, meta in schema.items():
+                        raw_sub_val = sub.get(key)
+                        fmt_sub_val = format_lighthouse_value(raw_sub_val, meta['type'])
+                        
+                        # Indent the first column visually
+                        if key == list(schema.keys())[0]:
+                            sub_row[meta['label']] = f" ↳ {fmt_sub_val}"
                         else:
-                            sub_row[label] = formatted
+                            sub_row[meta['label']] = fmt_sub_val
                     processed_rows.append(sub_row)
             else:
                 processed_rows.append(row)
                 
         return pd.DataFrame(processed_rows)
 
-    # --- CRITICAL CHAINS MODE ---
+    # --- TYPE B: CRITICAL REQUEST CHAINS ---
     elif details.get("type") == "criticalrequestchain":
         chains = details.get("chains", {})
         flat = []
@@ -175,9 +177,9 @@ def process_audit_details(audit):
             for k, v in node.items():
                 req = v.get("request", {})
                 flat.append({
-                    "Dependency": ("— " * depth) + str(req.get("url", "Unknown")),
+                    "Dependency Resource": ("— " * depth) + str(req.get("url", "Unknown")),
                     "Size": f"{req.get('transferSize',0)/1024:.1f} KB",
-                    "Time": f"{req.get('startTime',0)*1000:.0f} ms"
+                    "Time Cost": f"{req.get('startTime',0)*1000:.0f} ms"
                 })
                 if "children" in v: traverse(v["children"], depth+1)
         traverse(chains, 0)
@@ -192,12 +194,11 @@ def get_failed_audits(lighthouse):
     for key, audit in audits.items():
         score = audit.get("score")
         
-        # FAIL CONDITION: Score < 0.9 OR (Manual/Info AND Has Data)
+        # FAIL Logic: Score < 0.9 OR Manual/Info with data
         is_fail = (score is not None and score < 0.9)
         has_data = bool(audit.get("details", {}).get("items") or audit.get("details", {}).get("chains"))
         
         if is_fail or (score is None and has_data):
-            # Clean Links from Description
             desc = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', audit.get("description", ""))
             
             failed.append({
@@ -305,7 +306,6 @@ if run_btn and url_input:
                     st.markdown(f"**Impact:** {fail['description']}")
                     
                     if fail['df'] is not None and not fail['df'].empty:
-                        # Display clean table
                         st.dataframe(fail['df'], use_container_width=True, hide_index=True)
                     else:
-                        st.caption("No granular file data available via API.")
+                        st.caption("No granular file data returned by API.")
